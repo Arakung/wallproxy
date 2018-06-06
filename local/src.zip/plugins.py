@@ -4,14 +4,8 @@ from __future__ import with_statement
 def paas():
     # this part is compatible with goagent 1.1.0 by phus.lu@gmail.com and others
     print 'Initializing PAAS for proxy based on cloud service.'
-    class Hack(object):
-        set_hosts, Forward = config.import_from('util')
-        (HeaderDict, Proxy, URLInfo, unparse_netloc, del_bad_hosts
-            ) = config.import_from(utils)
-        v = (set_hosts, Forward, HeaderDict, Proxy, URLInfo, unparse_netloc,
-            del_bad_hosts)
-    (set_hosts, Forward, HeaderDict, Proxy, URLInfo, unparse_netloc, del_bad_hosts
-        ) = Hack.v
+    set_hosts, Forward = config.import_from('util')
+    HeaderDict, Proxy, URLInfo, unparse_netloc, del_bad_hosts = config.import_from(utils)
     import re, zlib, socket, struct, time, random, threading
     from binascii import a2b_hex, b2a_hex
     from base64 import b64encode
@@ -73,8 +67,8 @@ def paas():
         scheme = kw.get('scheme', 'http').lower()
         if scheme not in ('http', 'https'):
             raise ValueError('invalid scheme: '+scheme)
-        self.url = URLInfo('%s://%s.appspot.com%s?' % (
-            scheme, self.appids[0], kw.get('path', '/fetch.py')))
+        self.url = URLInfo('%s://%s%s?' % (scheme, v[0] if '.' in v[0]
+            else '%s.appspot.com' % v[0], kw.get('path', '/fetch.py')))
         self.password = kw.get('password', '')
         v = kw.get('proxy', 'default')
         self.proxy = config.global_proxy if v == 'default' else Proxy(v)
@@ -154,21 +148,25 @@ def paas():
                     opener.close()
                     if isinstance(e, HTTPError):
                         errors.append(str(e))
-                        if e.code == 503:
+                        if e.code in (503, 404, 403):
+                            if e.code == 503:
+                                errors[-1] = 'Bandwidth Over Quota(%s)'%self.appids[0]
+                            else:
+                                errors[-1] = '%s(%s)'%(errors[-1],self.appids[0])
+                                if self.proxy.value:
+                                    self.hosts.append(self.hosts.pop(0)); flag |= 2
+                                    print 'GAE: switch host to %s' % self.hosts[0]
+                                else:
+                                    del_bad_hosts()
                             ti -= 1
                             if server:
                                 url = self.url; server.__init__(url); server = None
                             else:
                                 si += 1
                                 self.appids.append(self.appids.pop(0)); flag |= 1
-                                url.hostname = '%s.appspot.com' % self.appids[0]
-                                print 'GAE: switch appid to %s' % self.appids[0]
-                        elif e.code == 404:
-                            if self.proxy.value:
-                                self.hosts.append(self.hosts.pop(0)); flag |= 2
-                                print 'GAE: switch host to %s' % self.hosts[0]
-                            else:
-                                del_bad_hosts()
+                                v = self.appids[0]
+                                url.hostname = v if '.' in v else '%s.appspot.com'%v
+                                print 'GAE: switch appid to %s' % v
                         elif e.code == 502:
                             if url.scheme != 'https':
                                 ti -= 1
@@ -176,7 +174,7 @@ def paas():
                                 print 'GAE: switch scheme to https'
                     elif isinstance(e, socket.error):
                         k = e.args[0]
-                        if url.scheme != 'https' and k in (10054, 54, 20054):
+                        if url.scheme != 'https' and k in (10054, 54, 20054, 104):
                             ti -= 1
                             url.scheme = 'https'; url.port = 443; flag |= 3
                             print 'GAE: switch scheme to https'
@@ -186,7 +184,7 @@ def paas():
                             print 'GAE: switch host to %s' % self.hosts[0]
                         else:
                             errors.append('Connect fetchserver failed: %s' % e)
-                            if del_bad_hosts() and k in (10054, 54, 20054, 10047): ti -= 1
+                            if del_bad_hosts() and k in (10054, 54, 20054, 104, 10047): ti -= 1
                     else:
                         errors.append('Connect fetchserver failed: %s' % e)
                     if flag & 1:
@@ -382,7 +380,8 @@ def paas():
             return tasks, task_size, info, write_content
 
         def _range_thread(self, server, params, tasks, lock, info, write_content):
-            server = URLInfo(self.url, hostname='%s.appspot.com' % server)
+            server = URLInfo(self.url,
+                hostname=server if '.' in server else '%s.appspot.com' % server)
             ct = params[0].copy()
             ct['headers'] = headers = HeaderDict(ct['headers'])
             params = ct, params[1]
@@ -628,11 +627,81 @@ def misc():
                 return req.send_error(413)
             data = tpl.format(listen=listen, version=version, req=req,
                     server=req.server_address, client=req.client_address,
-                    method=req.command, url=req.url, body=req.read_body())
+                    method=req.command, url=req.url, headers=req.headers,
+                    body=req.read_body())
             headers = HeaderDict()
             headers['Content-Length'] = str(len(data))
             req.start_response(200, headers)
             req.socket.sendall(data)
         return handler
 
-    globals().update(Page=Page)
+    def Redirects(regexps):
+        import re
+        from urllib import unquote
+        rules = tuple((re.compile(pat),repl) for pat,repl in regexps)
+        def handler(req):
+            url = req.url
+            for pat,repl in rules:
+                loc = pat.sub(repl, url)
+                if loc != url:
+                    loc = 'Location: %s\r\n' % unquote(loc)
+                    return lambda req: req.send_error(301, '', loc)
+        return handler
+
+    def LocalHandle(FORWARD):
+        import re, gzip
+        from cStringIO import StringIO
+        def hack_response1(FORWARD, req):
+            ctx = {}
+            data = []
+            bak = req.start_response, req.socket.sendall
+            def start_response(code, headers, message=None):
+                ctx['code'] = code
+                ctx['headers'] = headers
+                ctx['message'] = message
+            def sendall(d):
+                data.append(d)
+            req.start_response = start_response
+            req.socket.sendall = sendall
+            FORWARD(req)
+            req.start_response, req.socket.sendall = bak
+            ctx['data'] = ''.join(data)
+            return ctx
+        def hack_response2(ctx, req):
+            ctx['headers']['Content-Length'] = str(len(ctx['data']))
+            req.start_response(ctx['code'], ctx['headers'], ctx['message'])
+            req.socket.sendall(ctx['data'])
+        def build_new_request(req, body):
+            req.content_length = len(body)
+            req.headers['Content-Length'] = str(req.content_length)
+            def fake(old):
+                def read_body():
+                    req.content_length = 0
+                    req.read_body = old
+                    return body
+                return read_body
+            req.read_body = fake(req.read_body)
+        def handler(req):
+            if 0:
+                build_new_request(req, req.read_body())
+            return FORWARD(req)
+        return handler
+
+    def WebExtra():
+        misc_dir = utils.misc_dir
+        @config.web_register.append
+        def web_register(WebHeader, HTTPError, WebHandler, web_handler, web_error,
+                         main_dir, send_static_file, send_web_file):
+            web_root = os.path.join(misc_dir, 'web')
+            reg = web_handler(r'(https?://.*?(?:youku|qiyi|iqiyi|letv|sohu|ku6|ku6cdn|pps)\.(?:com|tv))/.*')([])
+            @reg('/(.+)')
+            def handler(web, file):
+                return send_static_file(web, web_root, file)
+
+            reg = web_handler(r'(http://cdn\.aixifan\.com)/.*')([])
+            @reg('/player/sslhomura/AcNewPlayer\d+.swf')
+            def handler(web):
+                return send_static_file(web, web_root, 'flashes/AcPlayer201412121_D.swf')
+    WebExtra()
+
+    globals().update(Page=Page, Redirects=Redirects, LocalHandle=LocalHandle)
